@@ -1,0 +1,1879 @@
+---
+title: "DSCI 4093 Capstone Project: Optimization of IBD Diagnosis"
+author: "Gavin Bulthuis"
+date: "2025-11-12"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Project Setup
+
+## Load Required Libraries
+
+We utilized a suite of packages for data manipulation (tidyverse), machine learning (ranger, caret), and model intepretability (fastshap, iml).
+```{r, message=FALSE}
+library(dplyr)
+library(readr)
+library(ranger)
+library(caret)
+library(pROC)
+library(tidyr)
+library(rpart)
+library(rpart.plot)
+library(ggplot2)
+library(iml)
+library(mice)
+library(themis)
+library(pheatmap)
+library(kableExtra)
+library(tidyverse)
+library(fastshap)
+library(shapviz)
+library(webshot2)
+
+# Load base dataset
+ibd_data <- read_csv("ibd_data.csv")
+```
+
+# Data Preprocessing
+
+## Dysbiosis Score Aggregation
+
+Raw dysbiosis data is provided at the sample level. We aggregate this to the patient level and define abnormality thresholds based on what was defined from the Metagenomics research.
+
+```{r, warning=FALSE, message=FALSE}
+# Load your data
+df <- read_csv("ibd_data_raw.csv")
+
+# Combine all External IDs for each Participant ID
+df_combined <- df %>%
+  group_by(`Participant ID`) %>%
+  summarise(All_External_IDs = paste(unique(`External ID`), collapse = ", ")) %>%
+  ungroup()
+
+# Load dysbiosis values
+df_dys <- read_tsv("dysbiosis.tsv", col_names = FALSE)
+colnames(df_dys) <- c("External ID", "dysbiosis_score", "abnormal_dysbiosis_score")
+
+
+# Unnest the options for External ID
+df_long <- df_combined %>%
+  mutate(External_ID = strsplit(All_External_IDs, ",\\s*")) %>%  # split into list of IDs
+  unnest(External_ID)                                            # expand into multiple rows
+
+# Join with dysbiosis data
+df_joined <- df_long %>%
+  left_join(df_dys, by = c("External_ID" = "External ID"))
+
+# Group back by participant and grab the average dysbiosis score
+df_final <- df_joined %>%
+  group_by(`Participant ID`) %>%
+  summarise(mean_dysbiosis_score = mean(dysbiosis_score, na.rm = TRUE)) %>%
+  ungroup()
+
+# Assign the abnormality by following the rule of 0.83+
+df_final <- df_final %>%
+  mutate(abnormal_dysbiosis_score = ifelse(mean_dysbiosis_score >= 0.83, "TRUE", "FALSE"))
+
+# Join to original data frame
+ibd_data <- ibd_data %>%
+  left_join(df_final, by = "Participant ID")
+```
+
+## Feature Standardization
+
+We rename raw survey columns to standardize snake_case variables for ease of coding and analysis.
+
+```{r}
+ibd_data <- ibd_data %>%
+  rename(
+    patient_weight = Weight.1,
+    hispanic_latino = `Hispanic or Latino Origin`,
+    height = Height,
+    bmi = BMI,
+    non_usa_country_origination = `If no, where were you born?`,
+    pregnant = `Subject is pregnant:`,
+    cholecystectomy = `Has the subject had a cholecystectomy?`,
+    abdominal_surgery = `Has the subject had a prior abdominal surgery (other)?`,
+    recent_hospitalization = `5) In the past 2 weeks, have you been hospitalized?`,
+    appendectomy = `Has the subject had an appendectomy?`,
+    tonsillectomy = `Has the subject had a tonsillectomy?`,
+    recent_colonoscopy = `2) In the past 2 weeks, have you undergone a colonoscopy or other procedure`,
+    endoscopy = `Has subject had an upper or lower endoscopy?`,
+    recent_diarrhea = `4) In the past 2 weeks, have you had diarrhea?`,
+    bowel_surgery = `6) Have you ever had bowel surgery?`,
+    breast_cancer = `Cancer - breast`,
+    cholangiocarcinoma_cancer = `Cancer - cholangiocarcinoma`,
+    colon_cancer = `Cancer - colon or rectum`,
+    hodgkins_cancer = `Cancer - Hodgkin's lymphoma`,
+    non_hodgkins_cancer = `Cancer - Non-Hodkin's lymphoma`,
+    liver_cancer = `Cancer - liver`,
+    lung_cancer = `Cancer - lung`,
+    lymphoma_cancer = `Cancer - lymphoma (not otherwise specified)`,
+    ovarian_cancer = `Cancer - ovarian`,
+    prostate_cancer = `Cancer - prostate`,
+    celiac = `Celiac sprue`,
+    bronchitis = `Chronic bronchitis`,
+    auto_immune = `Other immune mediated diseases`,
+    dermatitis = `Dermatitis herpetiformis`,
+    graves = `Grave's disease`,
+    guillian_barre = `Guillian-Barre Syndrome`,
+    hashimotos = `Hashimoto's (autoimmune) thyroiditis`,
+    idiopathic_pulmonary_fibrosis = `Idiopathic pulmonary fibrosis`,
+    idiopathic_throm_purpura = `Idiopathic thrombocytopenia purpura`,
+    alopecia = `Alopecia areata`,
+    multiple_sclerosis = `Multiple sclerosis`,
+    myasthenia_gravis = `Myasthenia gravis`,
+    myocarditis = Myocarditis,
+    neuropathy = Neuropathy,
+    pericarditis = Pericarditis,
+    pemphigus_vulgaris = `Pemphigus vulgaris`,
+    pernicious_anemia = `Pernicious anemia`,
+    polymositis = `Polymyositis or dermatomyositis`,
+    primary_billary_cirrhosis = `Primary biliary cirrhosis`,
+    primary_schlerosing_cholangitis = `Primary sclerosing cholangitis`,
+    ankylosing_spondylitis = `Ankylosing spondylitis`,
+    psoriasis = Psoriasis,
+    rheumatoid_arthritis = `Rheumatoid arthritis`,
+    sarcoidosis = Sarcoidosis,
+    scleroderma = `Scleroderma (systemic sclerosis)`,
+    sjogrens = `Sjogren's syndrome`,
+    systemic_lupus_erythematosis = `Systemic lupus erythematosis`,
+    temporal_arteritis = `Temporal arteritis`,
+    thyroid_disease = `Thyroid disease (uncertain diagnosis, not cancer)`,
+    diabetes = `Type I Diabetes (Juvenile Diabetes)`,
+    vitiligo = Vitiligo,
+    arthritis = `Arthritis (uncertain diagnosis)`,
+    wegeners_granulomatosis = `Wegener's granulomatosis`,
+    asthma = Asthma,
+    hemolytic_anemia = `Autoimmune hemolytic anemia`,
+    hepatitis = `Autoimmune hepatitis`,
+    bechets_syndrome = `Bechet's syndrome`,
+    farm_child = `Did you grow up on a farm?`,
+    daycare_child  = `Did you attend daycare as a child?`,
+    premature_child = `Were you born prematurely (more than 3 weeks early)?`,
+    cigarette_child = `Were you exposed to cigarette smoke as a child?`,
+    hospital_born_child = `Were you born in a hospital?`,
+    c_section_child = `Were you born via C-section?`,
+    usa_child = `Were you born in the United States?`,
+    breastfed_child = `Were you breastfed as an infant?`,
+    antibiotics_child = `Were you treated with antibiotics before the age of one?`,
+    hospitalization_child = `Were you hospitalized before the age of five?`,
+    pets_child = `Did you have pets growing up?`,
+    education = `Education Level`,
+    occupation = Occupation,
+    smoker = `smoking status`,
+    marijuana = `Do you currently smoke marijuana?`,
+    marijuana_frequency = `If yes, how many times per month do you smoke marijuana on average?`,
+    bile_production = `In the past 2 months, have you used any medications modifying bile production`,
+    acid_reducers = `In the past 2 months, have you used any acid reducing medication`,
+    acid_reducers_frequency = `If yes, how frequently do you take them?`,
+    anti_inflammatory_meds = `Do you use non-steroidal anti-inflammatory medications`,
+    anti_inflammatory_meds_frequency = `If yes, how frequently do you take them?.1`,
+    female_contraception = `If you are female, do you use hormonal contraception?`,
+    female_contraception_type = `If yes, what type of contraception?`,
+    female_contraception_brand = `Please list your current hormonal contraceptive:`, 
+    recent_antibiotics = `In the past 6 months, have you used antibiotics?`,
+    current_antibiotics = Antibiotics,
+    chemo = Chemotherapy,
+    immunosuppressants = `Immunosuppressants (e.g. oral corticosteroids)`,
+    meat_preferences = `What are your dietary preferences with respect to meat?`,
+    sugary_drinks = `Soft drinks, tea or coffee with sugar (corn syrup, maple syrup, cane sugar, etc)`,
+    artificially_sweet_drinks = `Diet soft drinks, tea or coffee with sugar (Stevia, Equal, Splenda etc)`,
+    fruit_juice = `Fruit juice (orange, apple, cranberry, prune etc.)`,
+    water = Water,
+    alcohol = `Alcohol (beer, brandy, spirits, hard liquor, wine, aperitif, etc.)`,
+    yogurt = `Yogurt or other foods containing active bacterial cultures (kefir, sauerkraut)`,
+    dairy = `Dairy (milk, cream, ice cream, cheese, cream cheese)`,
+    probiotic = Probiotic,
+    fruits = `Fruits (no juice) (Apples, raisins, bananas, oranges, strawberries, blueberries`,
+    vegetables = `Vegetables (salad, tomatoes, onions, greens, carrots, peppers, green beans, etc)`,
+    beans = `Beans (tofu, soy, soy burgers, lentils, Mexican beans, lima beans etc)`,
+    whole_grains = `Whole grains (wheat, oats, brown rice, rye, quinoa, wheat bread, wheat pasta)`,
+    starch = `Starch (white rice, bread, pizza, potatoes, yams, cereals, pancakes, etc.)`,
+    eggs = Eggs,
+    processed_meat = `Processed meat (other red or white meat such as lunch meat, ham, salami, bologna`,
+    red_meat = `Red meat (beef, hamburger, pork, lamb)`,
+    white_meat = `White meat (chicken, turkey, etc.)`,
+    shellfish = `Shellfish (shrimp, lobster, scallops, etc.)`,
+    fish = `Fish (fish nuggets, breaded fish, fish cakes, salmon, tuna, etc.)`,
+    tea_coffee = `Tea or coffee no sugar and no sugar replacement`,
+    sweets = `Sweets (pies, jam, chocolate, cake, cookies, etc.)`,
+    eye_condition = `2a. Red or sore eyes`,
+    abcesses_abdomen = `2b. An abscess (collection of puss) in your abdomen (belly)`,
+    abcesses_buttocks = `2c. An abscess on the buttock or around the anus`,
+    fistula = `2e. A fistula (an abdominal connection`,
+    draining_fistual = `2f. A draining fistula (if you have a fistula to the skin)`,
+    skin_problems = `2g. Skin problems`,
+    fever = `3a. Fever greater than 100 degrees Fahrenheit`,
+    fatigue = `3b. Fatigue or lack of energy`,
+    sleep_difficulty = `3c. Difficulty sleeping`,
+    nausea = `3d. Nausea`,
+    vomiting = `3e. Vomiting`,
+    mouth_sores = `3f. Mouth sores`,
+    back_pain = `3g. Back pain`,
+    night_sweats = `3h. Night sweats`,
+    decreased_appetite = `3i. Decreased appetite`,
+    weight_loss = `3j. Weight loss`,
+    abdominal_pain = `Abdominal pain`,
+    gas = `6. Problem with passing large amounts of gas`,
+    arthralgia = Arthralgia,
+    day_stools = `Bowel frequency during the day`,
+    night_stools = `Bowel frequency during the night`,
+    stool_urgency = `Urgency of defecation`,
+    bloody_stool = `Blood in the stool`,
+    restless_sleep = `My sleep was restless...`, 
+    sleep_satisfaction = `I was satisfied with my sleep...`,
+    sleep_quality = `In the past 7 days, my sleep quality was...`,
+    sleep_refreshing = `In the past 7 days, my sleep was refreshing...`,
+    sleep_effort = `I tried hard to get to sleep...`,
+    sleep_problems = `I had a problem with my sleep...`, 
+    sleep_worried = `I worried about not being able to fall asleep...`,
+    social_life = `2. Delay or cancel a social engagement`,
+    leisure = `3. Difficulty doing leisure or sports activities`, 
+    depression = `I felt depressed...`,
+    recent_depression = `5. How often during the last two weeks have you felt depressed or discouraged? P`,
+    wellbeing = `General wellbeing`,
+    recent_wellbeing = `General well being over the past 24 hours`,
+    biopsy_location = biopsy_location,
+    dysbiosis_score = mean_dysbiosis_score,
+    is_inflamed = is_inflamed,
+    modified_barons_score = `Modified Baron's Score`,
+    ses_cd_score = `SES-CD Score`,
+    left_colon_severity = `What is the endoscopic grading of severity?`,
+    rectum_severity = `What is the endoscopic grading of severity?.1`,
+    ileum_severity = `What is the endoscopic grading of severity?.2`,
+    right_colon_severity = `What is the endoscopic grading of severity?.3`,
+    transverse_colon_severity = `What is the endoscopic grading of severity?.4`,
+    ileum_ulcers = Ileum,
+    right_colon_ulcers = `Right Colon`,
+    left_colon_ulcers = `Left Colon`,
+    rectum_ulcers = Rectum,
+    transverse_colon_ulcers = `Transverse Colon`,
+    ileum_ulcerated = Ileum.1,
+    right_colon_ulcerated = `Right Colon.1`,
+    left_colon_ulcerated = `Left Colon.1`,
+    transverse_colon_ulcerated = `Transverse Colon.1`,
+    rectum_ulcerated = Rectum.1,
+    ileum_inflammation = Ileum.2,
+    right_colon_inflammation = `Right Colon.2`,
+    left_colon_inflammation = `Left Colon.2`,
+    transverse_colon_inflammation = `Transverse Colon.2`,
+    rectum_inflammation = Rectum.2,
+    crp = `CRP (mg/L)`,
+    esr = `ESR (mm/hr)`,
+    fecalcal_ng_ml = fecalcal_ng_ml,
+    fecalcal = fecalcal,
+    sccai = sccai,
+    sibdq_score = `SIBDQ Score`
+  )
+```
+
+## Defining Clinical Tiers
+
+Features are divided into four tiers representing the clinical progression from non-invasive to invasive diagnostics.
+- Tier 1: Risk Factors (Patient History)
+- Tier 2: Symptoms (Patient Reported Outcomes)
+- Tier 3: Biomarkers (Lab Results)
+- Tier 4: Endoscopy (Invasive Procedure)
+
+```{r}
+t1_features <- c(
+  "diagnosis", "patient_weight", "hispanic_latino", "height",
+  "bmi", "non_usa_country_origination", "cholecystectomy", "abdominal_surgery",
+  "recent_hospitalization", "appendectomy", "tonsillectomy", 
+  "endoscopy", "farm_child",
+  "daycare_child", "premature_child", "cigarette_child", "hospital_born_child",
+  "c_section_child", "usa_child", "breastfed_child", "antibiotics_child",
+  "hospitalization_child", "pets_child", "education", "occupation",
+  "smoker", "marijuana", "marijuana_frequency", "bile_production",
+  "acid_reducers", "acid_reducers_frequency", "anti_inflammatory_meds", "anti_inflammatory_meds_frequency",
+  "female_contraception", "female_contraception_type", "female_contraception_brand", 
+  "current_antibiotics", "chemo", "meat_preferences",
+  "sugary_drinks", "artificially_sweet_drinks", "fruit_juice", "water",
+  "alcohol", "yogurt", "dairy", "probiotic",
+  "fruits", "vegetables", "beans", "whole_grains",
+  "starch", "eggs", "processed_meat", "red_meat",
+  "white_meat", "shellfish", "fish", "tea_coffee",
+  "sweets"
+)
+
+t2_features <- c(
+  "diagnosis",
+  "eye_condition",
+  "abcesses_abdomen",
+  "abcesses_buttocks",
+  "fistula",
+  "draining_fistual",
+  "skin_problems",
+  "fever",
+  "fatigue",
+  "sleep_difficulty",
+  "nausea",
+  "vomiting",
+  "mouth_sores",
+  "back_pain",
+  "night_sweats",
+  "decreased_appetite",
+  "weight_loss",
+  "abdominal_pain",
+  "gas",
+  "arthralgia",
+  "day_stools",
+  "night_stools",
+  "bloody_stool",
+  "stool_urgency",
+  "restless_sleep",
+  "sleep_satisfaction",
+  "sleep_quality",
+  "sleep_refreshing",
+  "sleep_effort",
+  "sleep_problems",
+  "sleep_worried",
+  "social_life",
+  "leisure",
+  "depression",
+  "recent_depression",
+  "wellbeing",
+  "recent_wellbeing",
+  "recent_diarrhea",
+  "recent_antibiotics"
+)
+
+t3_features <- c(
+  "diagnosis",
+  "crp",
+  "esr",
+  "fecalcal",
+  "fecalcal_ng_ml",
+  "sccai",
+  "sibdq_score"
+)
+
+t4_features <- c(
+  "diagnosis",
+  "biopsy_location",
+  "dysbiosis_score",
+  "is_inflamed",
+  "modified_barons_score",
+  "ses_cd_score",
+  "left_colon_severity",
+  "rectum_severity",
+  "ileum_severity",
+  "right_colon_severity",
+  "transverse_colon_severity",
+  "ileum_ulcers",
+  "right_colon_ulcers",
+  "left_colon_ulcers",
+  "rectum_ulcers",
+  "transverse_colon_ulcers",
+  "ileum_ulcerated",
+  "right_colon_ulcerated",
+  "left_colon_ulcerated",
+  "transverse_colon_ulcerated",
+  "rectum_ulcerated",
+  "ileum_inflammation",
+  "right_colon_inflammation",
+  "left_colon_inflammation",
+  "transverse_colon_inflammation",
+  "rectum_inflammation",
+  "recent_colonoscopy",
+  "bowel_surgery"
+)
+```
+
+# Model Development
+
+## Feature Selection & Factorization
+We prepare the dataset for the Random Forest classifier by ensuring all categorical variables are factors and defining the target (IBD vs nonIBD).
+
+```{r}
+# Select grouping of features that you want
+data <- ibd_data %>%
+  select(all_of(t1_features), all_of(t2_features))  # Change the grouping here
+
+# Make sure that the categorical features are factors
+categorical_cols <- names(data)[sapply(data, function(x) !is.numeric(x))]
+data[categorical_cols] <- lapply(data[categorical_cols], as.factor)
+
+# Make the diagnosis column into a binary classification
+data <- data %>%
+  mutate(diagnosis = ifelse(diagnosis %in% c("CD", "UC"), "IBD", "nonIBD"))
+
+# Map diagnosis as a factor
+data$diagnosis <- factor(data$diagnosis, 
+  levels = c("IBD", "nonIBD")
+)
+```
+
+## Hyperparameter Optimization (Grid Search)
+
+We perform a a grid search to try and optimize mtry, min.node.size, and num.trees for the RF algorithm. We prioritize Balanced Accuracy due to class imbalance.
+
+```{r}
+# Hyperparameter choices
+mtry <- round(sqrt(ncol(data)))
+mtry_vals <- c(3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+t3_mtry_vals <- c(3, 4, 5, 6) # USE FOR TRAINING TIER 3 ALONE
+min_node_vals <- c(2, 4, 6)
+num_tree_vals <- c(250, 500, 1000, 1500, 2000, 2500)
+
+# Choose folds
+k <- 10
+folds <- sample(1:k, nrow(data), replace = TRUE)
+
+# Result storage
+results <- data.frame(
+  mtry = numeric(),
+  min_node = numeric(),
+  num_trees = numeric(),
+  Balanced_Accuracy = numeric(),
+  Raw_Accuracy = numeric(),
+  stringsAsFactors = FALSE
+)
+```
+
+
+```{r}
+set.seed(4093)
+
+for (m in mtry_vals) {
+  for (node in min_node_vals) {
+    for (tree in num_tree_vals) {
+      
+      cv_preds <- factor(rep(NA, nrow(data)), levels = levels(data$diagnosis))
+      
+      for (i in 1:k) {
+        train_data <- data[folds != i, ]
+        test_data  <- data[folds == i, ]
+        
+        # Count the minority class size in this specific fold
+        n_minority <- sum(train_data$diagnosis == "nonIBD")
+        
+        # Split train_data into two groups
+        train_ibd <- train_data %>% filter(diagnosis == "IBD")
+        train_non <- train_data %>% filter(diagnosis == "nonIBD")
+
+        # Randomly sample IBD to match nonIBD size
+        train_ibd_down <- train_ibd %>% sample_n(nrow(train_non))
+
+        # 3. Combine them back together
+        train_balanced <- bind_rows(train_non, train_ibd_down)
+        
+        # # Make weighing of classes the same
+        # case_weights <- ifelse(train_data$diagnosis == "nonIBD", 4, 1)
+        
+        # Train ranger with NA imputation
+        rf_model <- ranger(
+          formula = diagnosis ~ .,
+          data = train_balanced,
+          mtry = m,
+          num.trees = tree,
+          min.node.size = node,
+          probability = TRUE,
+          importance = "impurity",
+          na.action = "na.learn",
+          #case.weights = case_weights
+        )
+        
+        # Predict class
+        pred <- predict(rf_model, data = test_data)
+        pred_probs <- as.data.frame(pred$predictions)
+        
+        
+        class_pred <- colnames(pred_probs)[apply(pred_probs, 1, which.max)]
+        cv_preds[folds == i] <- class_pred
+      }
+      
+      cm <- confusionMatrix(
+        factor(cv_preds, levels = levels(data$diagnosis)), 
+        factor(data$diagnosis, levels = levels(data$diagnosis))
+      )
+      
+      bal_acc <- cm$byClass["Balanced Accuracy"]
+      
+      raw_acc <- cm$overall["Accuracy"]
+      
+      # 3. Store results focusing on Balanced Accuracy
+      results <- rbind(results, data.frame(
+        mtry = m,
+        min_node = node,
+        num_trees = tree,
+        Balanced_Accuracy = bal_acc,
+        Raw_Accuracy = raw_acc,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+}
+
+best_params <- results[which.max(results$Balanced_Accuracy), ]
+best_params
+```
+
+## Final Model Training
+
+Training the final model using the optimal hyperparameters found above. Also analyze the results.
+
+```{r}
+set.seed(4093)
+
+best_mtry <- best_params$mtry
+best_trees <- best_params$num_trees
+best_node <- best_params$min_node
+
+# Choose folds
+k <- 10
+folds <- sample(1:k, nrow(data), replace = TRUE)
+
+# Create a df to hold the ground truth
+cv_results <- data.frame(actual = data$diagnosis, predicted = NA)
+
+# Create a df to hold the feature importances
+importance_mat <- matrix(NA, nrow = ncol(data) - 1, ncol = k)
+rownames(importance_mat) <- setdiff(names(data), "diagnosis")
+
+# Create a matrix to store predicted probs for AUC
+prob_mat <- matrix(NA,
+  nrow = nrow(data),
+  ncol = length(levels(data$diagnosis))
+)
+colnames(prob_mat) <- levels(data$diagnosis)
+
+for(i in 1:k) {
+  
+  # Train on k-1 folds
+  train_data <- data[folds != i, ]
+  test_data  <- data[folds == i, ]
+  
+  # Count the minority class size in this specific fold
+  n_minority <- sum(train_data$diagnosis == "nonIBD")
+        
+  # Split train_data into two groups
+  train_ibd <- train_data %>% filter(diagnosis == "IBD")
+  train_non <- train_data %>% filter(diagnosis == "nonIBD")
+
+  # Randomly sample IBD to match nonIBD size
+  train_ibd_down <- train_ibd %>% sample_n(nrow(train_non))
+
+  # Combine them back together
+  train_balanced <- bind_rows(train_non, train_ibd_down)
+  
+  # # Make weighing of classes the same
+  # case_weights <- ifelse(train_data$diagnosis == "nonIBD", 4, 1)
+  
+  # Random forests model
+  rf_model <- ranger(
+    formula = diagnosis ~ ., 
+    data = train_balanced,
+    mtry = best_mtry,
+    num.trees = best_trees,
+    min.node.size = best_node,
+    probability = TRUE,
+    importance = "impurity",
+    na.action = "na.learn", 
+    #case.weights = case_weights
+  )
+  
+  pred_probs <- predict(rf_model, data = test_data)$predictions
+  pred_classes <- colnames(pred_probs)[apply(pred_probs, 1, which.max)]
+  cv_results$predicted[folds == i] <- pred_classes
+  importance_mat[, i] <- rf_model$variable.importance
+  prob_mat[folds == i, ] <- pred_probs
+}
+```
+
+```{r}
+# Confusion matrix
+conf_mat <- confusionMatrix(
+  factor(cv_results$predicted, levels = levels(data$diagnosis)),
+  factor(cv_results$actual, levels = levels(data$diagnosis))
+)
+
+# Variable importance
+avg_importance <- rowMeans(importance_mat, na.rm = TRUE)
+importance_df <- data.frame(
+  Feature = rownames(importance_mat),
+  Importance = avg_importance
+) %>% arrange(desc(Importance))
+
+# AUC
+actual <- cv_results$actual
+prob_ibd <- prob_mat[, "IBD"] 
+roc_obj <- roc(actual, prob_ibd, levels = c("nonIBD", "IBD"), direction = "<")
+roc_df <- data.frame(
+  threshold = roc_obj$thresholds,
+  sensitivity = roc_obj$sensitivities,
+  specificity = roc_obj$specificities
+)
+auc_val <- auc(roc_obj)
+```
+
+
+```{r}
+# Downsample the FULL dataset
+all_ibd <- data %>% filter(diagnosis == "IBD")
+all_non <- data %>% filter(diagnosis == "nonIBD")
+
+# Use the same balancing ratio (match minority class)
+n_min_all <- min(nrow(all_ibd), nrow(all_non))
+
+all_balanced <- bind_rows(
+  sample_n(all_ibd, n_min_all), 
+  sample_n(all_non, n_min_all)
+)
+# Train the Final RF
+rf_model_final <- ranger(
+  formula = diagnosis ~ ., 
+  data = all_balanced,
+  mtry = best_mtry,
+  num.trees = best_trees,
+  min.node.size = best_node,
+  probability = TRUE,
+  importance = "impurity",
+  na.action = "na.learn"
+)
+
+# OVERWRITE rf_model so downstream code (SHAP/Saving) uses the full one
+rf_model <- rf_model_final
+print("Final Production Model Trained on 100% of Data")
+```
+
+
+```{r}
+# Choose between Confusion Matrix, Feature Importance, AUC Value
+conf_mat
+importance_df
+auc_val
+```
+
+## Save Model Artifacts
+
+NOTE: Make sure to change the prefix when running different combinations of tiers.
+
+```{r}
+# !!! CHANGE THIS PREFIX FOR EACH MODEL !!!
+current_prefix <- "t1t2" 
+
+# Save the model object 
+saveRDS(rf_model_final, file = paste0(current_prefix, ".rds"))
+
+# Save the metrics to specific variables in RAM
+assign(paste0(current_prefix, "_conf"), conf_mat)
+assign(paste0(current_prefix, "_auc"), auc_val)
+assign(paste0(current_prefix, "_importance"), importance_df)
+
+```
+
+## Performance Analysis
+
+Aggregating results from all tier combinations to evaluate the value that each tier adds in the respective clinical stages.
+
+```{r}
+model_names <- c("t1", "t2", "t3", "t4", 
+                 "t1t2", "t1t2t3", "t1t2t3t4", 
+                 "t2t3t4", "t2t3", "t3t4")
+
+# Initialize an empty data frame to store results
+performance_results <- data.frame()
+
+for (model in model_names) {
+  
+  # Construct variable names dynamically
+  conf_name <- paste0(model, "_conf")
+  auc_name  <- paste0(model, "_auc")
+  
+  # Check if these exist in the environment
+  if (exists(conf_name) && exists(auc_name)) {
+    
+    # Get the actual objects
+    cm_obj <- get(conf_name)
+    auc_val <- get(auc_name)
+    
+    # Extract metrics (Standard Medical Metrics)
+    bal_acc     <- cm_obj$byClass['Balanced Accuracy']
+    sensitivity <- cm_obj$byClass['Sensitivity']
+    specificity <- cm_obj$byClass['Specificity']
+    
+    ppv         <- cm_obj$byClass['Pos Pred Value']  # Precision
+    npv         <- cm_obj$byClass['Neg Pred Value']
+    prevalence  <- cm_obj$byClass['Prevalence']      # Disease rate in this test set
+    
+    # Combine into a temporary row
+    temp_row <- data.frame(
+      Model = model,
+      AUC = as.numeric(auc_val),
+      Balanced_Acc = as.numeric(bal_acc),
+      PPV = as.numeric(ppv),
+      NPV = as.numeric(npv),
+      Prevalence = as.numeric(prevalence),
+      row.names = NULL
+    )
+    
+    performance_results <- rbind(performance_results, temp_row)
+  } else {
+    warning(paste("Objects for model", model, "not found."))
+  }
+}
+
+# Clean up model names for visual purposes
+performance_results$Model <- factor(performance_results$Model, levels = model_names)
+
+# View the final table
+print(performance_results)
+```
+
+## Visualizing Performance
+
+```{r}
+table_html <- performance_results %>%
+  arrange(desc(AUC)) %>% # Sort by best AUC
+  kbl(caption = "Model Performance Metrics", digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  column_spec(2, bold = TRUE, color = "white", background = spec_color(performance_results$AUC, begin = 0.3, end = 0.8, option = "A"))
+
+table_html
+```
+
+```{r}
+# Reshape data for plotting
+perf_long <- performance_results %>%
+  pivot_longer(cols = c(AUC, Balanced_Acc, PPV, NPV), 
+               names_to = "Metric", 
+               values_to = "Value")
+
+model_performance_bars <- ggplot(perf_long, aes(x = Model, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+  facet_wrap(~Metric, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Comparison of Model Performance Metrics",
+       subtitle = "Across different time-point combinations",
+       y = "Score") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") +
+  scale_fill_viridis_d()
+
+model_performance_bars
+```
+
+## Feature Importance Visualization
+
+Identify which features drive predictions across different groupings of tiers.
+
+```{r}
+importance_combined <- data.frame()
+
+for (model in model_names) {
+  imp_name <- paste0(model, "_importance")
+  
+  if (exists(imp_name)) {
+    imp_df <- get(imp_name)
+    
+    # Handle different Importance formats
+    # Assuming imp_df has row names as features or a column named "Feature"
+    if (!"Feature" %in% names(imp_df)) {
+      imp_df$Feature <- rownames(imp_df)
+    }
+    
+    
+    # Add Model identifier
+    imp_df$Model <- model
+    
+    importance_combined <- rbind(importance_combined, imp_df[, c("Feature", "Importance", "Model")])
+  }
+}
+
+# Normalize importance (0 to 100) per model to make them comparable
+importance_combined <- importance_combined %>%
+  group_by(Model) %>%
+  mutate(Scaled_Importance = (Importance / max(Importance)) * 100) %>%
+  ungroup()
+```
+
+```{r}
+# Identify top features overall (average importance across all models)
+top_features <- importance_combined %>%
+  group_by(Feature) %>%
+  summarise(Mean_Imp = mean(Scaled_Importance)) %>%
+  top_n(20, Mean_Imp) %>%
+  pull(Feature)
+
+# Filter data for these features
+heatmap_data <- importance_combined %>%
+  filter(Feature %in% top_features) %>%
+  select(Feature, Model, Scaled_Importance) %>%
+  pivot_wider(names_from = Model, values_from = Scaled_Importance, values_fill = 0) %>%
+  column_to_rownames("Feature")
+
+# Plot
+pheatmap(heatmap_data, 
+         cluster_rows = TRUE, 
+         cluster_cols = FALSE,
+         display_numbers = FALSE,
+         fontsize = 10,
+         main = "Feature Importance Heatmap (Top 20 Global Features)",
+         filename = "feature_heatmap.png",
+         color = colorRampPalette(c("white", "orange", "firebrick"))(50))
+```
+
+```{r}
+gg_importance <- importance_combined %>%
+  group_by(Model) %>%
+  top_n(5, Scaled_Importance) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(Feature, Scaled_Importance), y = Scaled_Importance, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~Model, scales = "free_y", ncol = 3) +
+  theme_light() +
+  labs(title = "Top 5 Features by Model",
+       x = "Feature",
+       y = "Relative Importance (%)")
+
+gg_importance
+```
+
+## SHAP Analysis
+
+Calculating SHAP values to explain individual predictions. 
+
+```{r}
+data <- ibd_data
+
+# Make sure that the categorical features are factors
+categorical_cols <- names(data)[sapply(data, function(x) !is.numeric(x))]
+data[categorical_cols] <- lapply(data[categorical_cols], as.factor)
+
+# Select the features that are used in the models
+data <- data %>%
+  select(all_of(t3_features), all_of(t2_features), all_of(t1_features), all_of(t4_features))
+```
+
+```{r}
+# Refactor all of the ordinal columns with the help of Gemini
+
+# ==============================================================================
+# 1. DEFINE THE ORDERED LEVELS
+# ==============================================================================
+
+# --- A. Frequency Scales (Mental Health / Symptoms) ---
+# "Never" -> "Always"
+freq_always_levels <- c("Never", "Rarely", "Sometimes", "Often", "Always")
+
+# "None of the time" -> "All of the time"
+freq_time_levels <- c("None of the time", "Hardly any of the time", "A little of the time", 
+                      "Some of the time", "A good bit of the time", "Most of the time", "All of the time")
+
+# --- B. Intensity / Problem Scales ---
+# "Not at all" -> "Very much"
+intensity_levels <- c("Not at all", "A little bit", "Somewhat", "Quite a bit", "Very much")
+
+# "No trouble" -> "Big problem"
+trouble_levels <- c("No trouble", "Hardly any trouble", "A little trouble", "Some trouble", 
+                    "A significant problem", "A major problem", "A big problem")
+
+# "No difficulty" -> "A lot of difficulty"
+difficulty_levels <- c("No difficulty", "Hardly any difficulty", "A little difficulty", 
+                       "Some difficulty", "A fair bit of difficulty", "A lot of difficulty", 
+                       "A great deal of difficulty")
+
+# --- C. Quality & Wellbeing ---
+# "Very Poor" -> "Very Good"
+quality_levels <- c("Very poor", "Poor", "Fair", "Good", "Very good")
+
+# Wellbeing Specific
+wellbeing_levels <- c("Very Poor", "Poor", "Slightly below par", "Very Well") 
+# Note: "Excellent" wasn't in your unique values, but "Very Well" is the top.
+
+# --- D. Diet Frequency (The "Yesterday" Scale) ---
+# Logic: No -> Past Week -> Past 2-3 Days -> Yesterday (1-2) -> Yesterday (3+)
+diet_levels <- c("No, I did not consume these products in the last 7 days",
+                 "Within the past 4 to 7 days",
+                 "Within the past 2 to 3 days",
+                 "Yesterday, 1 to 2 times",
+                 "Yesterday, 3 or more times")
+
+# Medication Frequency
+med_freq_levels <- c("Almost never", "1-3 times a month", "1-5 times a week", 
+                     "Once a day", "More than once a day")
+
+# --- E. Endoscopy (Severity & Extent) ---
+# Severity
+endo_severity_levels <- c("Normal or inactive disease", 
+                          "Mild disease (erythema, decreased vascular pattern, mild friability)", 
+                          "Moderate disease (marked erythema, absent vascular pattern, friability, erosions)", 
+                          "Severe disease (spontaneous bleeding, ulceration)")
+
+# Ulcer Size
+ulcer_size_levels <- c("No ulcers", 
+                       "Aphthous ulcers (0.1 cm to 0.5 cm)", 
+                       "Large ulcers (0.5 cm to 2 cm)", 
+                       "Very large ulcers (>2 cm)")
+
+# Ulcer Extent (%)
+ulcer_pct_levels <- c("No ulcers", 
+                      "Less than 10% ulcerated", 
+                      "10% to 30% ulcerated", 
+                      "More than 30% ulcerated")
+
+# Inflammation Extent (%)
+inflam_pct_levels <- c("Unaffected segment", 
+                       "Less than 50% affected", 
+                       "50% to 75% affected", 
+                       "More than 75% affected")
+
+# --- F. Binary / Trinary (No -> Yes) ---
+binary_unsure_levels <- c("No", "Unsure", "Not Sure", "Yes")
+
+# ==============================================================================
+# 2. APPLY TO COLUMNS
+# ==============================================================================
+
+data <- ibd_data %>%
+  
+  # --- Fix Excel Date Errors in Stools ---
+  mutate(day_stools = recode(day_stools, "6-Apr" = "4-6", "9-Jul" = "7-9")) %>%
+  mutate(day_stools = factor(day_stools, levels = c("0 - 3", "4-6", "7-9"))) %>%
+
+  # --- Mental Health & Frequency ---
+  mutate(
+    depression = factor(depression, levels = freq_always_levels),
+    `I felt helpless...` = factor(`I felt helpless...`, levels = freq_always_levels),
+    `I felt hopeless...` = factor(`I felt hopeless...`, levels = freq_always_levels),
+    `I felt like a failure...` = factor(`I felt like a failure...`, levels = freq_always_levels),
+    `I felt unhappy...` = factor(`I felt unhappy...`, levels = freq_always_levels),
+    `I felt that I had nothing to look forward to...` = factor(`I felt that I had nothing to look forward to...`, levels = freq_always_levels),
+    `I felt that nothing could cheer me up...` = factor(`I felt that nothing could cheer me up...`, levels = freq_always_levels),
+    `In the past 7 days, I felt fearful...` = factor(`In the past 7 days, I felt fearful...`, levels = freq_always_levels),
+    `I found it hard to focus on anything other than my anxiety...` = factor(`I found it hard to focus on anything other than my anxiety...`, levels = freq_always_levels),
+    `My worries overwhelmed me...` = factor(`My worries overwhelmed me...`, levels = freq_always_levels),
+    `I felt uneasy...` = factor(`I felt uneasy...`, levels = freq_always_levels),
+    `I felt nervous...` = factor(`I felt nervous...`, levels = freq_always_levels),
+    `I felt like I needed help for my anxiety...` = factor(`I felt like I needed help for my anxiety...`, levels = freq_always_levels),
+    `I felt anxious...` = factor(`I felt anxious...`, levels = freq_always_levels),
+    `I felt tense...` = factor(`I felt tense...`, levels = freq_always_levels),
+    `In the past 7 days, I felt worthless...` = factor(`In the past 7 days, I felt worthless...`, levels = freq_always_levels)
+  ) %>%
+
+  # --- Time-Based Frequency ---
+  mutate(
+    recent_depression = factor(recent_depression, levels = freq_time_levels),
+    social_life = factor(social_life, levels = freq_time_levels),
+    `1. Feeling of fatigue` = factor(`1. Feeling of fatigue`, levels = freq_time_levels),
+    `8. Felt relaxed and free of tension` = factor(`8. Felt relaxed and free of tension`, levels = freq_time_levels),
+    `9. Troubled by a feeling of having to go to the bathroom` = factor(`9. Troubled by a feeling of having to go to the bathroom`, levels = freq_time_levels),
+    `10. Felt angry as a result of bowel problem` = factor(`10. Felt angry as a result of bowel problem`, levels = freq_time_levels),
+    `4. How often during the last 2 weeks have you been troubled by pain in the abdom` = factor(`4. How often during the last 2 weeks have you been troubled by pain in the abdom`, levels = freq_time_levels)
+  ) %>%
+
+  # --- Sleep Intensity & Problems ---
+  mutate(
+    sleep_effort = factor(sleep_effort, levels = intensity_levels),
+    sleep_problems = factor(sleep_problems, levels = intensity_levels),
+    sleep_worried = factor(sleep_worried, levels = intensity_levels),
+    restless_sleep = factor(restless_sleep, levels = intensity_levels),
+    sleep_refreshing = factor(sleep_refreshing, levels = intensity_levels),
+    `I had difficulty falling asleep...` = factor(`I had difficulty falling asleep...`, levels = intensity_levels),
+    # Note: Satisfaction is unique, usually High is Good, but here High is "Very Much Satisfied" (Good)
+    sleep_satisfaction = factor(sleep_satisfaction, levels = c("Not at all", "Somewhat", "A little bit", "Quite a bit", "Very much"))
+  ) %>%
+
+  # --- Trouble / Problems ---
+  mutate(
+    gas = factor(gas, levels = trouble_levels),
+    `7. Problem with weight` = factor(`7. Problem with weight`, levels = trouble_levels),
+    leisure = factor(leisure, levels = difficulty_levels)
+  ) %>%
+
+  # --- Quality ---
+  mutate(
+    sleep_quality = factor(sleep_quality, levels = quality_levels),
+    wellbeing = factor(wellbeing, levels = wellbeing_levels)
+  ) %>%
+
+  # --- Diet Columns (Batch Process) ---
+  mutate(across(c(
+    sugary_drinks, artificially_sweet_drinks, fruit_juice, water, alcohol, 
+    yogurt, dairy, probiotic, fruits, vegetables, beans, whole_grains, 
+    starch, eggs, processed_meat, red_meat, white_meat, shellfish, fish, 
+    tea_coffee, sweets
+  ), ~ factor(., levels = diet_levels))) %>%
+
+  # --- Medications ---
+  mutate(
+    acid_reducers_frequency = factor(acid_reducers_frequency, levels = med_freq_levels),
+    anti_inflammatory_meds_frequency = factor(anti_inflammatory_meds_frequency, levels = med_freq_levels)
+  ) %>%
+
+  # --- Endoscopy: Severity ---
+  mutate(across(c(
+    left_colon_severity, right_colon_severity, transverse_colon_severity, 
+    rectum_severity, ileum_severity
+  ), ~ factor(., levels = endo_severity_levels))) %>%
+
+  # --- Endoscopy: Ulcer Size ---
+  mutate(across(c(
+    ileum_ulcers, right_colon_ulcers, left_colon_ulcers, 
+    rectum_ulcers, transverse_colon_ulcers
+  ), ~ factor(., levels = ulcer_size_levels))) %>%
+
+  # --- Endoscopy: Ulcer Extent ---
+  mutate(across(c(
+    ileum_ulcerated, right_colon_ulcerated, left_colon_ulcerated, 
+    rectum_ulcerated, transverse_colon_ulcerated
+  ), ~ factor(., levels = ulcer_pct_levels))) %>%
+
+  # --- Endoscopy: Inflammation Extent ---
+  mutate(across(c(
+    ileum_inflammation, right_colon_inflammation, left_colon_inflammation, 
+    rectum_inflammation, transverse_colon_inflammation
+  ), ~ factor(., levels = inflam_pct_levels))) %>%
+    
+  # --- Misc Severity ---
+  mutate(
+    bloody_stool = factor(bloody_stool, levels = c("Trace (a little blood)", "Occasionally frank (ocassionally a lot of blood)", "Usually frank (usually a lot of blood)")),
+    stool_urgency = factor(stool_urgency, levels = c("Hurry", "Immediately", "Incontinence")),
+    education = factor(education, levels = c("Unknown/Not Reported", "7th grade or less", "Some high school", "High school graduate or GED", "Some college, no degree", "Associate degree", "Bachelor's degree", "Master's degree", "Professional/Doctoral degree"))
+  )
+
+# Verify one column to make sure it worked
+print("--- Verification: Sleep Quality Levels ---")
+print(levels(data$sleep_quality))
+```
+
+```{r}
+# Select grouping of features that you want
+data <- data %>%
+  select(all_of(t2_features), all_of(t1_features), all_of(t3_features))  # Change the grouping here
+
+# Make the diagnosis column into a binary classification
+data <- data %>%
+  mutate(diagnosis = ifelse(diagnosis %in% c("CD", "UC"), "IBD", "nonIBD"))
+
+# Map diagnosis as a factor
+data$diagnosis <- factor(data$diagnosis, 
+  levels = c("IBD", "nonIBD")
+)
+```
+
+
+```{r} 
+# Load model file
+model_file <- "t1t2t3.rds"
+
+# Helper function to check if data is loaded
+check_data_exists <- exists("data")
+
+if (file.exists(model_file) && check_data_exists) {
+  
+  shap_model <- readRDS(model_file)
+  
+  pfun <- function(object, newdata) {
+    pred <- predict(object, data = newdata)$predictions
+    
+    # Handle probability matrix output (common for classification)
+    if (is.matrix(pred) || is.data.frame(pred)) {
+      if ("IBD" %in% colnames(pred)) return(pred[, "IBD"])
+      return(pred[, 2]) # Return probability of positive class (usually 2nd col)
+    }
+    
+    # Fallback for other outputs
+    return(pred)
+  }
+  
+  # Calculate SHAP values
+  shap_vals <- fastshap::explain(shap_model, 
+                                 X = data, 
+                                 pred_wrapper = pfun, 
+                                 nsim = 10) 
+  
+  # Visualize
+  sv <- shapviz(shap_vals, X = data) 
+    
+} else {
+  message("Skipping SHAP analysis.")
+  if (!file.exists(model_file)) message(paste("Model file", model_file, "not found."))
+  if (!check_data_exists) message("Object 'X_train' not found in environment. Please load your predictor data.")
+}
+```
+
+
+```{r}
+t1_shap <- sv_importance(sv, kind = "beeswarm", show_numbers = TRUE, max_display = 15) +
+    ggtitle("SHAP Beeswarm Plot: t1 Model") +
+    theme_gray()
+
+t2_shap <- sv_importance(sv, kind = "beeswarm", show_numbers = TRUE, max_display = 15) +
+    ggtitle("SHAP Beeswarm Plot: t2 Model") +
+    theme_gray()
+
+t3_shap <- sv_importance(sv, kind = "beeswarm", show_numbers = TRUE, max_display = 15) +
+    ggtitle("SHAP Beeswarm Plot: t3 Model") +
+    theme_gray()
+
+t4_shap <- sv_importance(sv, kind = "beeswarm", show_numbers = TRUE, max_display = 15) +
+    ggtitle("SHAP Beeswarm Plot: t4 Model") +
+    theme_gray()
+
+t1t2t3t4_shap <- sv_importance(sv, kind = "beeswarm", show_numbers = TRUE, max_display = 15) +
+    ggtitle("SHAP Beeswarm Plot: t1t2t3t4 Model") +
+    theme_gray()
+
+t2t3t4_shap <- sv_importance(sv, kind = "beeswarm", show_numbers = TRUE, max_display = 15) +
+    ggtitle("SHAP Beeswarm Plot: t2t3t4 Model") +
+    theme_gray()
+
+t2t3_shap <- sv_importance(sv, kind = "beeswarm", show_numbers = TRUE, max_display = 15) +
+    ggtitle("SHAP Beeswarm Plot: t2t3 Model") +
+    theme_gray()
+
+t1t2_shap <- sv_importance(sv, kind = "beeswarm", show_numbers = TRUE, max_display = 15) +
+    ggtitle("SHAP Beeswarm Plot: t1t2 Model") +
+    theme_gray()
+
+t1t2t3_shap <- sv_importance(sv, kind = "beeswarm", show_numbers = TRUE, max_display = 15) +
+    ggtitle("SHAP Beeswarm Plot: t1t2t3 Model") +
+    theme_gray()
+
+t3t4_shap <- sv_importance(sv, kind = "beeswarm", show_numbers = TRUE, max_display = 15) +
+    ggtitle("SHAP Beeswarm Plot: t3t4 Model") +
+    theme_gray()
+
+t2t3t4_shap
+```
+
+# Clincial Simulations
+
+## Simulation 1: Progressive Tier System
+
+This simulation mimics the patient journey. A patient enters and is given a probability of IBD at each stage and decisions are made based on the predicted probabilities.
+
+```{r}
+# Load your saved models 
+model_t1 <- readRDS("t1.rds") # Risk Factors
+model_t2 <- readRDS("t1t2.rds") # Symptoms
+model_t3 <- readRDS("t1t2t3.rds") # Biomarkers
+model_t4 <- readRDS("t1t2t3t4.rds") # Endoscopy
+```
+
+
+```{r}
+# Create a dataframe to store the simulation results
+# We track WHERE they stopped and WHAT the decision was
+sim_results <- data.frame(
+  Patient_ID = ibd_data$`Participant ID`, # Using ID for tracking
+  Actual_Diagnosis = ibd_data$diagnosis,
+  Final_Prediction = NA,
+  Stopped_At_Tier = NA,
+  Final_Probability = NA,
+  Cost_Score = 0 # 1=Low, 4=High
+)
+
+# Loop through every patient in your dataset
+for(i in 1:nrow(ibd_data)) {
+  
+  # Grab the single patient's data
+  patient_data <- ibd_data[i, ]
+  
+  # Tier 1 -- Risk Factors
+  # Predict
+  pred_t1 <- predict(model_t1, data = patient_data)$predictions[, "IBD"]
+  
+  # Check Thresholds
+  if(pred_t1 < 0.20) {
+    sim_results$Final_Prediction[i] <- "nonIBD"
+    sim_results$Stopped_At_Tier[i] <- "Tier 1"
+    sim_results$Final_Probability[i] <- pred_t1
+    sim_results$Cost_Score[i] <- 1
+    next # Exit loop for this patient, move to next
+  } else if(pred_t1 > 0.80) {
+    sim_results$Final_Prediction[i] <- "IBD"
+    sim_results$Stopped_At_Tier[i] <- "Tier 1"
+    sim_results$Final_Probability[i] <- pred_t1
+    sim_results$Cost_Score[i] <- 1
+    next
+  }
+  
+  # Tier 2 -- Symptoms
+  pred_t2 <- predict(model_t2, data = patient_data)$predictions[, "IBD"]
+  
+  if(pred_t2 < 0.30) {
+    sim_results$Final_Prediction[i] <- "nonIBD"
+    sim_results$Stopped_At_Tier[i] <- "Tier 2"
+    sim_results$Final_Probability[i] <- pred_t2
+    sim_results$Cost_Score[i] <- 2
+    next
+  } else if(pred_t2 > 0.70) {
+    sim_results$Final_Prediction[i] <- "IBD"
+    sim_results$Stopped_At_Tier[i] <- "Tier 2"
+    sim_results$Final_Probability[i] <- pred_t2
+    sim_results$Cost_Score[i] <- 2
+    next
+  }
+  
+  # Tier 3 -- Biomarkers
+  pred_t3 <- predict(model_t3, data = patient_data)$predictions[, "IBD"]
+  
+  if(pred_t3 < 0.40) {
+    sim_results$Final_Prediction[i] <- "nonIBD"
+    sim_results$Stopped_At_Tier[i] <- "Tier 3"
+    sim_results$Final_Probability[i] <- pred_t3
+    sim_results$Cost_Score[i] <- 3
+    next
+  } else if(pred_t3 > 0.60) {
+    sim_results$Final_Prediction[i] <- "IBD"
+    sim_results$Stopped_At_Tier[i] <- "Tier 3"
+    sim_results$Final_Probability[i] <- pred_t3
+    sim_results$Cost_Score[i] <- 3
+    next
+  }
+  
+  # Tier 4 -- Endoscopy
+  pred_t4 <- predict(model_t4, data = patient_data)$predictions[, "IBD"]
+  
+  # Force a binary decision at the end (50% cutoff)
+  sim_results$Final_Prediction[i] <- ifelse(pred_t4 >= 0.5, "IBD", "nonIBD")
+  sim_results$Stopped_At_Tier[i] <- "Tier 4"
+  sim_results$Final_Probability[i] <- pred_t4
+  sim_results$Cost_Score[i] <- 4
+}
+```
+
+```{r}
+# Convert strings to factors for Confusion Matrix
+sim_results <- sim_results %>%
+  mutate(Actual_Diagnosis = ifelse(Actual_Diagnosis %in% c("CD", "UC", "IBD"), "IBD", "nonIBD")) %>%
+  mutate(Actual_Diagnosis = factor(Actual_Diagnosis, levels = c("IBD", "nonIBD"))) %>%
+  mutate(Final_Prediction = factor(Final_Prediction, levels = c("IBD", "nonIBD")))
+
+# Funnel Efficiency: How many people stopped at each tier?
+table(sim_results$Stopped_At_Tier)
+
+# Overall Accuracy of the Simulation: How good are the predictions?
+confusionMatrix(sim_results$Final_Prediction, sim_results$Actual_Diagnosis)
+
+# Accuracy by Tier: Did the "Cheap" tiers make mistakes? 
+tier_performance <- sim_results %>%
+  group_by(Stopped_At_Tier) %>%
+  summarise(
+    Patients_Handled = n(),
+    Tier_Accuracy = mean(Final_Prediction == Actual_Diagnosis)
+  )
+
+tier_performance
+```
+
+## Simulation 2: Individual Tier System
+
+Don't utilize features from previous tiers. Simply make predictions at each stage ONLY given the features from that specific tier.
+```{r}
+# Load your saved models 
+sep_model_t1 <- readRDS("t1.rds") # Risk Factors
+sep_model_t2 <- readRDS("t2.rds") # Symptoms
+sep_model_t3 <- readRDS("t3.rds") # Biomarkers
+sep_model_t4 <- readRDS("t4.rds") # Endoscopy
+```
+
+```{r}
+# Create a dataframe to store the simulation results
+# We track WHERE they stopped and WHAT the decision was
+sim_results_two <- data.frame(
+  Patient_ID = ibd_data$`Participant ID`, # Using ID for tracking
+  Actual_Diagnosis = ibd_data$diagnosis,
+  Final_Prediction = NA,
+  Stopped_At_Tier = NA,
+  Final_Probability = NA,
+  Cost_Score = 0 # 1=Low, 4=High
+)
+
+# Loop through every patient in your dataset
+for(i in 1:nrow(ibd_data)) {
+  
+  # Grab the single patient's data
+  patient_data <- ibd_data[i, ]
+  
+  # Tier 1 -- Risk Factors
+  # Predict
+  pred_t1 <- predict(sep_model_t1, data = patient_data)$predictions[, "IBD"]
+  
+  # Check Thresholds
+  if(pred_t1 < 0.20) {
+    sim_results_two$Final_Prediction[i] <- "nonIBD"
+    sim_results_two$Stopped_At_Tier[i] <- "Tier 1"
+    sim_results_two$Final_Probability[i] <- pred_t1
+    sim_results_two$Cost_Score[i] <- 1
+    next # Exit loop for this patient, move to next
+  } else if(pred_t1 > 0.80) {
+    sim_results_two$Final_Prediction[i] <- "IBD"
+    sim_results_two$Stopped_At_Tier[i] <- "Tier 1"
+    sim_results_two$Final_Probability[i] <- pred_t1
+    sim_results_two$Cost_Score[i] <- 1
+    next
+  }
+  
+  # Tier 2 -- Symptoms
+  pred_t2 <- predict(sep_model_t2, data = patient_data)$predictions[, "IBD"]
+  
+  if(pred_t2 < 0.30) {
+    sim_results_two$Final_Prediction[i] <- "nonIBD"
+    sim_results_two$Stopped_At_Tier[i] <- "Tier 2"
+    sim_results_two$Final_Probability[i] <- pred_t2
+    sim_results_two$Cost_Score[i] <- 2
+    next
+  } else if(pred_t2 > 0.70) {
+    sim_results_two$Final_Prediction[i] <- "IBD"
+    sim_results_two$Stopped_At_Tier[i] <- "Tier 2"
+    sim_results_two$Final_Probability[i] <- pred_t2
+    sim_results_two$Cost_Score[i] <- 2
+    next
+  }
+  
+  # Tier 3 -- Biomarkers
+  pred_t3 <- predict(sep_model_t3, data = patient_data)$predictions[, "IBD"]
+  
+  if(pred_t3 < 0.40) {
+    sim_results_two$Final_Prediction[i] <- "nonIBD"
+    sim_results_two$Stopped_At_Tier[i] <- "Tier 3"
+    sim_results_two$Final_Probability[i] <- pred_t3
+    sim_results_two$Cost_Score[i] <- 3
+    next
+  } else if(pred_t3 > 0.60) {
+    sim_results_two$Final_Prediction[i] <- "IBD"
+    sim_results_two$Stopped_At_Tier[i] <- "Tier 3"
+    sim_results_two$Final_Probability[i] <- pred_t3
+    sim_results_two$Cost_Score[i] <- 3
+    next
+  }
+  
+  # Tier 4 -- Endoscopy
+  pred_t4 <- predict(sep_model_t4, data = patient_data)$predictions[, "IBD"]
+  
+  # Force a binary decision at the end (50% cutoff)
+  sim_results_two$Final_Prediction[i] <- ifelse(pred_t4 >= 0.5, "IBD", "nonIBD")
+  sim_results_two$Stopped_At_Tier[i] <- "Tier 4"
+  sim_results_two$Final_Probability[i] <- pred_t4
+  sim_results_two$Cost_Score[i] <- 4
+}
+```
+
+```{r}
+# Convert strings to factors for Confusion Matrix
+sim_results_two <- sim_results_two %>%
+  mutate(Actual_Diagnosis = ifelse(Actual_Diagnosis %in% c("CD", "UC", "IBD"), "IBD", "nonIBD")) %>%
+  mutate(Actual_Diagnosis = factor(Actual_Diagnosis, levels = c("IBD", "nonIBD"))) %>%
+  mutate(Final_Prediction = factor(Final_Prediction, levels = c("IBD", "nonIBD")))
+
+# Funnel Efficiency: How many people stopped at each tier?
+table(sim_results_two$Stopped_At_Tier)
+
+# Overall Accuracy of the Simulation: How good are the predictions?
+confusionMatrix(sim_results_two$Final_Prediction, sim_results_two$Actual_Diagnosis)
+
+# Accuracy by Tier: Did the "Cheap" tiers make mistakes? 
+tier_performance_two <- sim_results_two %>%
+  group_by(Stopped_At_Tier) %>%
+  summarise(
+    Patients_Handled = n(),
+    Tier_Accuracy = mean(Final_Prediction == Actual_Diagnosis)
+  )
+
+tier_performance_two
+```
+
+## Simulation 3: Using Optimal Models
+
+This simulation combines the first two simulations and chooses the best model at each stage whether it adds features or not.
+
+```{r}
+# Load your saved models 
+best_model_t1 <- readRDS("t1.rds") # Risk Factors
+best_model_t2 <- readRDS("t2.rds") # Symptoms
+best_model_t3 <- readRDS("t2t3.rds") # Biomarkers
+best_model_t4 <- readRDS("t2t3t4.rds") # Endoscopy
+```
+
+```{r}
+# Create a dataframe to store the simulation results
+# We track WHERE they stopped and WHAT the decision was
+sim_results_three <- data.frame(
+  Patient_ID = ibd_data$`Participant ID`, # Using ID for tracking
+  Actual_Diagnosis = ibd_data$diagnosis,
+  Final_Prediction = NA,
+  Stopped_At_Tier = NA,
+  Final_Probability = NA,
+  Cost_Score = 0 # 1=Low, 4=High
+)
+
+# Loop through every patient in your dataset
+for(i in 1:nrow(ibd_data)) {
+  
+  # Grab the single patient's data
+  patient_data <- ibd_data[i, ]
+  
+  # Tier 1 -- Risk Factors
+  # Predict
+  pred_t1 <- predict(best_model_t1, data = patient_data)$predictions[, "IBD"]
+  
+  # Check Thresholds
+  if(pred_t1 < 0.20) {
+    sim_results_three$Final_Prediction[i] <- "nonIBD"
+    sim_results_three$Stopped_At_Tier[i] <- "Tier 1"
+    sim_results_three$Final_Probability[i] <- pred_t1
+    sim_results_three$Cost_Score[i] <- 1
+    next # Exit loop for this patient, move to next
+  } else if(pred_t1 > 0.80) {
+    sim_results_three$Final_Prediction[i] <- "IBD"
+    sim_results_three$Stopped_At_Tier[i] <- "Tier 1"
+    sim_results_three$Final_Probability[i] <- pred_t1
+    sim_results_three$Cost_Score[i] <- 1
+    next
+  }
+  
+  # Tier 2 -- Symptoms
+  pred_t2 <- predict(best_model_t2, data = patient_data)$predictions[, "IBD"]
+  
+  if(pred_t2 < 0.30) {
+    sim_results_three$Final_Prediction[i] <- "nonIBD"
+    sim_results_three$Stopped_At_Tier[i] <- "Tier 2"
+    sim_results_three$Final_Probability[i] <- pred_t2
+    sim_results_three$Cost_Score[i] <- 2
+    next
+  } else if(pred_t2 > 0.70) {
+    sim_results_three$Final_Prediction[i] <- "IBD"
+    sim_results_three$Stopped_At_Tier[i] <- "Tier 2"
+    sim_results_three$Final_Probability[i] <- pred_t2
+    sim_results_three$Cost_Score[i] <- 2
+    next
+  }
+  
+  # Tier 3 -- Biomarkers
+  pred_t3 <- predict(best_model_t3, data = patient_data)$predictions[, "IBD"]
+  
+  if(pred_t3 < 0.40) {
+    sim_results_three$Final_Prediction[i] <- "nonIBD"
+    sim_results_three$Stopped_At_Tier[i] <- "Tier 3"
+    sim_results_three$Final_Probability[i] <- pred_t3
+    sim_results_three$Cost_Score[i] <- 3
+    next
+  } else if(pred_t3 > 0.60) {
+    sim_results_three$Final_Prediction[i] <- "IBD"
+    sim_results_three$Stopped_At_Tier[i] <- "Tier 3"
+    sim_results_three$Final_Probability[i] <- pred_t3
+    sim_results_three$Cost_Score[i] <- 3
+    next
+  }
+  
+  # Tier 4 -- Endoscopy
+  pred_t4 <- predict(best_model_t4, data = patient_data)$predictions[, "IBD"]
+  
+  # Force a binary decision at the end (50% cutoff)
+  sim_results_three$Final_Prediction[i] <- ifelse(pred_t4 >= 0.5, "IBD", "nonIBD")
+  sim_results_three$Stopped_At_Tier[i] <- "Tier 4"
+  sim_results_three$Final_Probability[i] <- pred_t4
+  sim_results_three$Cost_Score[i] <- 4
+}
+```
+
+
+```{r}
+# Convert strings to factors for confusion matrix
+sim_results_three <- sim_results_three %>%
+  mutate(Actual_Diagnosis = ifelse(Actual_Diagnosis %in% c("CD", "UC", "IBD"), "IBD", "nonIBD")) %>%
+  mutate(Actual_Diagnosis = factor(Actual_Diagnosis, levels = c("IBD", "nonIBD"))) %>%
+  mutate(Final_Prediction = factor(Final_Prediction, levels = c("IBD", "nonIBD")))
+
+# Funnel efficiency: How many people stopped at each tier?
+table(sim_results_three$Stopped_At_Tier)
+
+# Overall accuracy of the simulation: How good are the predictions?
+confusionMatrix(sim_results_three$Final_Prediction, sim_results_three$Actual_Diagnosis)
+
+# Accuracy by tier: Did the "Cheap" tiers make mistakes? 
+tier_performance_three <- sim_results_three %>%
+  group_by(Stopped_At_Tier) %>%
+  summarise(
+    Patients_Handled = n(),
+    Tier_Accuracy = mean(Final_Prediction == Actual_Diagnosis)
+  )
+
+tier_performance_three
+```
+
+
+## Simulation 4: Resource Constrained Simulation
+
+Simulating a scenario where the clinic only has the budget to give scopes to the top 15% of risk-stratified patients. NOTE: Use top performing set of models (from Simulation 3).
+
+```{r}
+# Load your saved models 
+model_t1 <- readRDS("t1.rds") # Risk Factors
+model_t2 <- readRDS("t2.rds") # Symptoms
+model_t3 <- readRDS("t2t3.rds") # Biomarkers
+model_t4 <- readRDS("t2t3t4.rds") # Endoscopy
+
+# Select grouping of features that you want
+data <- ibd_data %>%
+  select(`Participant ID`,
+         all_of(t1_features), all_of(t2_features), all_of(t3_features), all_of(t4_features))  # Change the grouping here
+
+# Make the diagnosis column into a binary classification
+data <- data %>%
+  mutate(diagnosis = ifelse(diagnosis %in% c("CD", "UC"), "IBD", "nonIBD"))
+
+# Map diagnosis as a factor
+data$diagnosis <- factor(data$diagnosis, 
+  levels = c("IBD", "nonIBD")
+)
+
+# Add synthetic cohort
+df_healthy <- data %>% filter(diagnosis == "nonIBD")
+df_sick    <- data %>% filter(diagnosis == "IBD") #<!--%>% sample_n(nrow(df_healthy))-->
+
+sim_data   <- bind_rows(df_healthy, df_sick)
+```
+
+```{r}
+# Scenario: The clinic only has budget to scope the Top 15% of patients.
+
+# Literature suggests ~15-20% of abdominal referrals get scoped in resource-conscious systems.
+MAX_SCOPES <- round(nrow(sim_data) * 0.15) # Approx 20 patients
+print(paste("New Simulation N:", nrow(sim_data)))
+print(paste("Clinic Capacity:", MAX_SCOPES, "Endoscopy Slots Available"))
+
+# Storage for Results
+sim_budget <- data.frame(
+  Patient_ID = sim_data$`Participant ID`,
+  Actual_Diagnosis = sim_data$diagnosis,
+  Tier3_Prob = NA,
+  Decision = NA,
+  Final_Prediction = NA
+)
+
+# Run Screening Phase
+# We collect the risk scores but DO NOT decide on endoscopy yet.
+for(i in 1:nrow(sim_data)) {
+  
+  patient_data <- sim_data[i, ]
+  
+  # We use the t2t3 model because it's the most accurate "Pre-Scope" score
+  p3 <- predict(model_t3, data = patient_data)$predictions[, "IBD"]
+  sim_budget$Tier3_Prob[i] <- p3
+  
+  # Initial Decision based on standard thresholds
+  if(p3 < 0.40) {
+    sim_budget$Decision[i] <- "Discharge (Low Risk)"
+    sim_budget$Final_Prediction[i] <- "nonIBD"
+  } else if(p3 > 0.60) {
+    sim_budget$Decision[i] <- "Treat (High Risk)"
+    sim_budget$Final_Prediction[i] <- "IBD"
+  } else {
+    sim_budget$Decision[i] <- "Refer for Scope (Uncertain)"
+  }
+}
+
+# Allocating the scopes
+candidates <- which(sim_budget$Decision == "Refer for Scope (Uncertain)")
+
+# Sort scope candidates by risk
+# We prioritize patients closest to 1.0 (Most likely to be sick)
+candidate_indices <- candidates[order(sim_budget$Tier3_Prob[candidates], decreasing = TRUE)]
+
+# Assign scopes based on budget
+num_candidates <- length(candidate_indices)
+num_to_scope   <- min(num_candidates, MAX_SCOPES)
+
+# The lucky ones who get the scope
+approved_indices <- head(candidate_indices, num_to_scope)
+
+# The ones we can't afford to scope (sent to "Wait & See")
+denied_indices   <- setdiff(candidate_indices, approved_indices)
+
+# Finalize Diagnoses
+# Scoped Patients (Get t2t3t4 Accuracy)
+for(idx in approved_indices) {
+  p4 <- predict(model_t4, data = sim_data[idx, ])$predictions[, "IBD"]
+  sim_budget$Final_Prediction[idx] <- ifelse(p4 > 0.5, "IBD", "nonIBD")
+  sim_budget$Decision[idx] <- "Scope Performed"
+}
+
+# Denied Patients (Assumed Healthy / Monitor)
+# This is where we risk missing cases
+for(idx in denied_indices) {
+  sim_budget$Final_Prediction[idx] <- "nonIBD" # Assumed safe to wait
+  sim_budget$Decision[idx] <- "Denied Scope (Capacity)"
+}
+
+# Analyze the "Cost" of the Constraint
+# How many sick people did we miss in the "Denied" group?
+missed_cases <- sim_budget %>%
+  filter(Decision == "Denied Scope (Capacity)") %>%
+  filter(Actual_Diagnosis == "IBD")
+
+print("--- RESOURCE CONSTRAINT ANALYSIS ---")
+print(paste("Patients wanting scope:", num_candidates))
+print(paste("Scopes performed:", num_to_scope))
+print(paste("Patients denied:", length(denied_indices)))
+print(paste("MISSED DIAGNOSES (Safety Violation):", nrow(missed_cases)))
+
+# Confusion Matrix of the Budgeted System
+cm_budget <- confusionMatrix(factor(sim_budget$Final_Prediction, levels = c("IBD", "nonIBD")), 
+                             factor(sim_budget$Actual_Diagnosis, levels = c("IBD", "nonIBD")))
+print(cm_budget)
+```
+
+
+## Simulation 5: Population Sensitivity Analysis
+
+Bootstrap simulation of 200 patients to test robustness.
+```{R}
+# Scenario: 200 Patients (20% Prevalence) run through the COMPLETE traffic light.
+set.seed(4093)
+
+# Create Synthetic "Primary Care" Cohort (N = 200, 20% Sick)
+target_n <- 200
+n_sick   <- round(target_n * 0.20)
+n_health <- target_n - n_sick
+
+# Bootstrap the population
+df_sick_pop   <- data %>% filter(diagnosis == "IBD") %>% sample_n(n_sick, replace = TRUE)
+df_health_pop <- data %>% filter(diagnosis == "nonIBD") %>% sample_n(n_health, replace = TRUE)
+sim_data      <- bind_rows(df_sick_pop, df_health_pop)
+
+# Define Capacity (Budget)
+# We can only scope 15% of the 200 patients (30 Scopes)
+MAX_SCOPES <- 30
+print(paste("Population:", nrow(sim_data), "| Capacity:", MAX_SCOPES, "Scopes"))
+
+results <- data.frame(
+  Patient_ID = seq_len(nrow(sim_data)),
+  Actual_Diagnosis = sim_data$diagnosis,
+  Stopped_At = NA,
+  Final_Prediction = NA,
+  Risk_Score_T3 = NA # We track this to rank them for the budget
+)
+
+# Run Tiers 1, 2, and 3 (Non-Invasive Screening)
+for(i in 1:nrow(sim_data)) {
+  p_data <- sim_data[i, ]
+  
+  # --- TIER 1: Risk Factors (model_t1) ---
+  p1 <- predict(model_t1, data = p_data)$predictions[, "IBD"]
+  if(p1 < 0.20) {
+    results$Final_Prediction[i] <- "nonIBD"; results$Stopped_At[i] <- "Tier 1"; next
+  } else if(p1 > 0.80) {
+    results$Final_Prediction[i] <- "IBD"; results$Stopped_At[i] <- "Tier 1"; next
+  }
+  # --- TIER 2: Symptoms (model_t2) ---
+  p2 <- predict(model_t2, data = p_data)$predictions[, "IBD"]
+  if(p2 < 0.30) {
+    results$Final_Prediction[i] <- "nonIBD"; results$Stopped_At[i] <- "Tier 2"; next
+  } else if(p2 > 0.70) {
+    results$Final_Prediction[i] <- "IBD"; results$Stopped_At[i] <- "Tier 2"; next
+  }
+  
+  # --- TIER 3: Biomarkers (model_t2t3) ---
+  # Note: We use t2t3 here because it's the strongest pre-scope model
+  p3 <- predict(model_t2t3, data = p_data)$predictions[, "IBD"]
+  results$Risk_Score_T3[i] <- p3 # Save this for ranking!
+  
+  if(p3 < 0.40) {
+    results$Final_Prediction[i] <- "nonIBD"; results$Stopped_At[i] <- "Tier 3"; next
+  } else if(p3 > 0.60) {
+    results$Final_Prediction[i] <- "IBD"; results$Stopped_At[i] <- "Tier 3"; next
+  } else {
+    results$Stopped_At[i] <- "Referred for Scope" # Needs Tier 4
+  }
+}
+
+# Apply the Budget (The Bottleneck)
+# Find everyone who NEEDS a scope (The "Referred" group)
+referrals <- which(results$Stopped_At == "Referred for Scope")
+
+# Rank them by urgency (Higher Tier 3 Risk = Priority)
+priority_list <- referrals[order(results$Risk_Score_T3[referrals], decreasing = TRUE)]
+
+# Cut the line
+approved_indices <- head(priority_list, min(length(priority_list), MAX_SCOPES))
+denied_indices   <- setdiff(priority_list, approved_indices)
+
+# Run Tier 4 (Endoscopy) for Approved Patients
+for(idx in approved_indices) {
+  p4 <- predict(model_t2t3t4, data = sim_data[idx, ])$predictions[, "IBD"]
+  results$Final_Prediction[idx] <- ifelse(p4 >= 0.5, "IBD", "nonIBD")
+  results$Stopped_At[idx] <- "Tier 4 (Scoped)"
+}
+
+# Deny Care to the Rest
+for(idx in denied_indices) {
+  results$Final_Prediction[idx] <- "nonIBD" # Assumed Healthy / Monitoring
+  results$Stopped_At[idx] <- "Denied Scope (Capacity)"
+}
+
+# Final Analysis
+results$Final_Prediction <- factor(results$Final_Prediction, levels = c("IBD", "nonIBD"))
+
+# Metrics
+cm_final <- confusionMatrix(results$Final_Prediction, results$Actual_Diagnosis)
+missed_cases <- results %>% filter(Actual_Diagnosis == "IBD" & Final_Prediction == "nonIBD")
+
+print("--- FULL PIPELINE SENSITIVITY ANALYSIS ---")
+print(table(results$Stopped_At))
+print(paste("Total Missed Cases:", nrow(missed_cases)))
+print(cm_final)
+```
+
+
+## Feature Tier Overview
+
+Visualizing the clinical steps. Used in paper.
+```{r}
+# Define the data
+tier_df <- data.frame(
+  Tier = c(
+    "Tier 1: Risk Factors",
+    "Tier 2: Patient-Reported Symptoms", 
+    "Tier 3: Biomarkers",
+    "Tier 4: Endoscopy & Histology"
+  ),
+  Type = c(
+    "Demographics & Patient History",
+    "Clinical & Current Health",
+    "Labratory Results",
+    "Procedural Results"
+  ),
+  Features = c(
+    "Weight, Height, BMI, Nationality, Education, Occupation, Premature Birth, C-Section Birth, Hospitalizations, Smoking Status, Anti-Inflammatory Meds, Contraception, Antibiotics, Alcohol Use, Red Meat, Fruit & Veg Consumption",
+    
+    "Recent Diarrhea, Well-Being, Depression, Bloody Stools, Stool Urgency, Weight Loss, Abdominal Pain, Nausea, Sleep Difficulty, Fever, Fatigue, Leisure Activity, Social Life, Eye Condition, Vomiting, Back Pain, Mouth Sores",
+    
+    "C-Reactive Protein (CRP), ESR, Fecal Calprotectin, SCCAI, SIBDQ Score",
+    
+    "Dysbiosis Score, Macroscopic Inflammation, Modified Baron’s Score, SES-CD Score, Area Specific Severity, Ulcerations, Biopsy Location"
+  )
+)
+
+# Create the Table
+# Note: If knitting to HTML, use format="html". If PDF/Poster, use format="latex".
+tier_chart <- tier_df %>%
+  kbl(caption = "Feature Engineering: A Stepwise Clinical Progression", booktabs = TRUE) %>%
+  kable_styling(full_width = TRUE, font_size = 11) %>%
+  
+  # Column Styling
+  column_spec(1, bold = TRUE, width = "3cm", color = "white", background = "#4A148C") %>% # Purple (Tier 1)
+  column_spec(2, italic = TRUE, width = "3cm") %>%
+  column_spec(3, width = "12cm") %>%
+  
+  # Row Styling (Mimicking your image colors)
+  row_spec(1, color = "black", background = "#E1BEE7") %>% # Light Purple
+  row_spec(2, color = "black", background = "#BBDEFB") %>% # Light Blue
+  row_spec(3, color = "black", background = "#C8E6C9") %>% # Light Green
+  row_spec(4, color = "black", background = "#FFF9C4")    # Light Yellow
+
+```
+
+## Personal Case Study: "Test Gavin"
+
+Testing the model against my own data from the time of my diagnosis to validate real-world applicability.
+```{r}
+# Select grouping of features that you want
+data <- ibd_data %>%
+  select(all_of(t1_features), all_of(t2_features), all_of(t3_features), all_of(t4_features))  # Change the grouping here
+
+# Make sure that the categorical features are factors
+categorical_cols <- names(data)[sapply(data, function(x) !is.numeric(x))]
+data[categorical_cols] <- lapply(data[categorical_cols], as.factor)
+
+# Make the diagnosis column into a binary classification
+data <- data %>%
+  mutate(diagnosis = ifelse(diagnosis %in% c("CD", "UC"), "IBD", "nonIBD"))
+
+# Map diagnosis as a factor
+data$diagnosis <- factor(data$diagnosis, 
+  levels = c("IBD", "nonIBD")
+)
+
+# Load in the Gavin row
+gavin <- read.csv("gavin.csv")
+
+gavin <- gavin %>% rename(Patient_ID = X)
+gavin[, 1] <- "Gavin"
+new_patient <- gavin
+```
+
+```{r}
+print(paste("Testing Patient:", gavin$`Participant ID`))
+
+# --- TIER 1 ---
+p1 <- predict(model_t1, data = new_patient)$predictions[, "IBD"]
+print(paste("Tier 1 Prob:", round(p1, 2)))
+
+if(p1 > 0.80) {
+  print("Diagnosis: IBD (Stopped at Tier 1)")
+} else if(p1 < 0.20) {
+  print("Diagnosis: Healthy (Stopped at Tier 1)")
+} else {
+  print("-> Indeterminate. Moving to Tier 2...")
+  
+  # --- TIER 2 ---
+  p2 <- predict(model_t2, data = new_patient)$predictions[, "IBD"]
+  print(paste("Tier 2 Prob:", round(p2, 2)))
+  
+  if(p2 > 0.70) {
+    print("Diagnosis: IBD (Stopped at Tier 2)")
+  } else if(p2 < 0.30) {
+    print("Diagnosis: Healthy (Stopped at Tier 2)")
+  } else {
+    print("-> Indeterminate. Moving to Tier 3...")
+    
+    # --- TIER 3 ---
+    p3 <- predict(model_t3, data = new_patient)$predictions[, "IBD"]
+    print(paste("Tier 3 Prob:", round(p3, 2)))
+    
+    if(p3 > 0.65) {
+      print("Diagnosis: IBD (Stopped at Tier 3)")
+    } else if(p3 < 0.35) {
+      print("Diagnosis: Healthy (Stopped at Tier 3)")
+    } else {
+      print("-> Indeterminate. Moving to Tier 4 (Endoscopy)...")
+      
+      # --- TIER 4 ---
+      p4 <- predict(model_t4, data = new_patient)$predictions[, "IBD"]
+      print(paste("Tier 4 Prob:", round(p4, 2)))
+      final_dx <- ifelse(p4 > 0.5, "IBD", "Healthy")
+      print(paste("Final Diagnosis:", final_dx))
+    }
+  }
+}
+```
+
+```{r}
+# Get probabilities for myself for all of the models individually
+
+# Load your saved models 
+model_t1 <- readRDS("t1.rds") # Risk Factors
+model_t2 <- readRDS("t1t2.rds") # Symptoms
+model_t3 <- readRDS("t1t2t3.rds") # Biomarkers
+model_t4 <- readRDS("t1t2t3t4.rds") # Endoscopy
+model_t1t2 <- readRDS("t1t2.rds") 
+model_t2t3 <- readRDS("t2t3.rds")
+model_t1t2t3 <- readRDS("t1t2t3.rds") 
+model_t1t2t3t4 <- readRDS("t1t2t3t4.rds") 
+model_t2t3t4 <- readRDS("t2t3t4.rds") 
+model_t3t4 <- readRDS("t3t4.rds")
+
+models <- list(model_t1, model_t2, model_t3, model_t4, model_t1t2, model_t2t3, model_t1t2t3, model_t1t2t3t4, model_t2t3t4, model_t3t4)
+model_names <- c("t1", "t2", "t3", "t4", "t1t2", "t2t3", "t1t2t3", "t1t2t3t4", "t2t3t4", "t3t4")
+
+# Loop through and get the predicted probability for each model
+for (i in seq_along(models)) {
+  prediction <- predict(models[[i]], data = new_patient)$predictions[, "IBD"]
+  print(paste(model_names[i], "Probability:", round(prediction, 2)))
+}
+```
