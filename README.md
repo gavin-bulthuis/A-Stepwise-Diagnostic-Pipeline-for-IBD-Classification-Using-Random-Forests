@@ -101,7 +101,7 @@ The features are grouped into four tiers of increasing complexity and cost.
 
 ## Project Guidance
 
-This project was guided by Julian Wolfson, phD from the University of Minnesota's School of Public Health.
+This project was guided by Julian Wolfson, PhD from the University of Minnesota's School of Public Health.
 
 ## Data Privacy & Ethics
 
