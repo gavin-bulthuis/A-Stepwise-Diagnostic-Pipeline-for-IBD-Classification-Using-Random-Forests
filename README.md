@@ -46,7 +46,6 @@ saveRDS(rf_model_final, file = paste0(current_prefix, ".rds"))
 
 ### 3. Execution Strategy
 
-* 
 **Sequential Setup:** Run the "Setup," "Data Prep," and "Tier Definition" chunks first to load libraries and process the raw data .
 
 
@@ -100,7 +99,9 @@ The features are grouped into four tiers of increasing complexity and cost.
 
 **Simulation Performance:** In a resource-constrained simulation (only 15% of patients scoped), the model correctly diagnosed 96% of patients by prioritizing high-risk cases for endoscopy.
 
+## Project Guidance
 
+This project was guided by Julian Wolfson, phD from the University of Minnesota's School of Public Health.
 
 ## Data Privacy & Ethics
 
