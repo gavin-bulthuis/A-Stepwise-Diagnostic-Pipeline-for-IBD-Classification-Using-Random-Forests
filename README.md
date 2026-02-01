@@ -61,7 +61,6 @@ saveRDS(rf_model_final, file = paste0(current_prefix, ".rds"))
 
 The features are grouped into four tiers of increasing complexity and cost.
 
-* 
 **Tier 1: Risk Factors (Demographics & History)** 
 
 
@@ -69,15 +68,13 @@ The features are grouped into four tiers of increasing complexity and cost.
 * *Goal:* Establish baseline susceptibility.
 
 
-* 
 **Tier 2: Patient-Reported Symptoms** 
 
 
 * *Examples:* Stool frequency, Abdominal pain, Fatigue, Well-being.
 * *Goal:* Capture active signs of disease via low-cost office visits.
 
-
-* 
+ 
 **Tier 3: Biomarkers** 
 
 
@@ -85,7 +82,6 @@ The features are grouped into four tiers of increasing complexity and cost.
 * *Goal:* Provide objective measurements of inflammation without invasive procedures.
 
 
-* 
 **Tier 4: Endoscopy & Histology** 
 
 
@@ -96,15 +92,12 @@ The features are grouped into four tiers of increasing complexity and cost.
 
 ## Key Results
 
-* 
 **Symptom Utility:** Tier 2 (Symptoms) and Tier 3 (Biomarkers) combined offer the most cost-efficient diagnostic path, achieving high accuracy without requiring colonoscopy for all patients.
 
 
-* 
 **Feature Importance:** Patient-reported symptoms like "recent diarrhea" and biomarkers like "fecal calprotectin" were consistently the most predictive features.
 
 
-* 
 **Simulation Performance:** In a resource-constrained simulation (only 15% of patients scoped), the model correctly diagnosed 96% of patients by prioritizing high-risk cases for endoscopy.
 
 
